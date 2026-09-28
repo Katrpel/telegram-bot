@@ -17,7 +17,7 @@ BOT_TOKEN = "8365458785:AAHyVIla42H9kRKG0oT8SQvjiOFiWjOeTSE"
 
 ADMIN_IDS = [
     1170348114,   # <-- ЗАМЕНИТЕ на ваш ID
-    # 987654321, # <-- ID второго наблюдателя
+    358930137, # <-- ID второго наблюдателя
 ]
 
 PAGE_SIZE = 10
