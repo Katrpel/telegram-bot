@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, BigInte
 from sqlalchemy.orm import DeclarativeBase, Session
 
 # ============ НАСТРОЙКИ ============
-BOT_TOKEN = 8365458785:AAHyVIla42H9kRKG0oT8SQvjiOFiWjOeTSE
+BOT_TOKEN = "8365458785:AAHyVIla42H9kRKG0oT8SQvjiOFiWjOeTSE"
 
 ADMIN_IDS = [
     1170348114,   # <-- ЗАМЕНИТЕ на ваш ID
