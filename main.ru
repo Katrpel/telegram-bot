@@ -7,20 +7,25 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
     Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, BufferedInputFile
+    CallbackQuery, BufferedInputFile, ReplyKeyboardMarkup,
+    KeyboardButton, ReplyKeyboardRemove
 )
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, BigInteger, select, func
-from sqlalchemy.orm import DeclarativeBase, Session
+from sqlalchemy import (
+    create_engine, Column, Integer, String, DateTime,
+    BigInteger, ForeignKey, select, func
+)
+from sqlalchemy.orm import DeclarativeBase, Session, relationship
 
 # ============ НАСТРОЙКИ ============
 BOT_TOKEN = "8365458785:AAHyVIla42H9kRKG0oT8SQvjiOFiWjOeTSE"
 
 ADMIN_IDS = [
-    1170348114,   # <-- ЗАМЕНИТЕ на ваш ID
-    358930137, # <-- ID второго наблюдателя
+    1170348114,
+    358930137,
 ]
 
 PAGE_SIZE = 10
+MAX_ATTACHMENTS = 20
 
 logging.basicConfig(level=logging.INFO)
 
@@ -32,7 +37,6 @@ CATEGORIES = {
     "forming": " Формование",
 }
 
-# ============ ПЕРИОДЫ ДЛЯ ФИЛЬТРА ============
 DATE_FILTERS = {
     "today":  "📅 Сегодня",
     "yday":   "📅 Вчера",
@@ -64,6 +68,22 @@ class Note(Base):
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, nullable=True)
 
+    attachments = relationship(
+        "Attachment", back_populates="note",
+        cascade="all, delete-orphan", order_by="Attachment.id"
+    )
+
+class Attachment(Base):
+    __tablename__ = "attachments"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    note_id = Column(Integer, ForeignKey("notes.id", ondelete="CASCADE"), index=True)
+    kind = Column(String)
+    file_id = Column(String)
+    file_name = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.now)
+
+    note = relationship("Note", back_populates="attachments")
+
 engine = create_engine("sqlite:///lab_notes.db")
 Base.metadata.create_all(engine)
 
@@ -85,6 +105,17 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 user_state = {}
 
+# ============ REPLY-КЛАВИАТУРА (постоянные кнопки внизу) ============
+def main_reply_kb():
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🏠 Главное меню"), KeyboardButton(text="📝 Новая запись")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+    return kb
+
 # ============ ХЕЛПЕРЫ ============
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -102,16 +133,21 @@ def register_user(user_id: int, full_name: str):
             session.add(User(user_id=user_id, full_name=full_name))
         session.commit()
 
-def save_note(user_id: int, category: str, text: str = None,
-              photo_id: str = None, document_id: str = None, document_name: str = None):
+def save_note_with_attachments(user_id, category, text, attachments):
     user = get_user(user_id)
     author = user.full_name if user else f"ID:{user_id}"
     with Session(engine) as session:
-        session.add(Note(
-            user_id=user_id, author_name=author, category=category,
-            text=text, photo_id=photo_id,
-            document_id=document_id, document_name=document_name
-        ))
+        note = Note(user_id=user_id, author_name=author,
+                    category=category, text=text)
+        session.add(note)
+        session.flush()
+        for att in attachments:
+            session.add(Attachment(
+                note_id=note.id,
+                kind=att["kind"],
+                file_id=att["file_id"],
+                file_name=att.get("file_name"),
+            ))
         session.commit()
 
 def get_note(note_id: int):
@@ -137,7 +173,6 @@ def update_note_text(note_id: int, new_text: str) -> bool:
         session.commit()
         return True
 
-# ---- Период -> диапазон дат ----
 def date_range_start(period: str):
     now = datetime.now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -149,20 +184,16 @@ def date_range_start(period: str):
         return today_start - timedelta(days=6)
     if period == "30d":
         return today_start - timedelta(days=29)
-    return None  # all
+    return None
 
 def date_range_end(period: str):
     if period == "yday":
-        now = datetime.now()
-        return now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     return None
 
 def parse_user_date(s: str):
-    """Парсит ДД.ММ.ГГГГ или ДД.ММ. Возвращает datetime или None.
-    Если год не указан — текущий."""
     s = s.strip()
-    formats = ["%d.%m.%Y", "%d.%m.%y", "%d.%m"]
-    for fmt in formats:
+    for fmt in ["%d.%m.%Y", "%d.%m.%y", "%d.%m"]:
         try:
             dt = datetime.strptime(s, fmt)
             if fmt == "%d.%m":
@@ -172,8 +203,7 @@ def parse_user_date(s: str):
             continue
     return None
 
-def count_notes(user_id: int = None, category: str = None,
-                since: datetime = None, until: datetime = None) -> int:
+def count_notes(user_id=None, category=None, since=None, until=None) -> int:
     with Session(engine) as session:
         stmt = select(func.count(Note.id))
         if user_id:
@@ -186,9 +216,8 @@ def count_notes(user_id: int = None, category: str = None,
             stmt = stmt.where(Note.created_at < until)
         return session.scalar(stmt) or 0
 
-def get_notes_page(user_id: int = None, category: str = None,
-                   since: datetime = None, until: datetime = None,
-                   offset: int = 0, limit: int = PAGE_SIZE):
+def get_notes_page(user_id=None, category=None, since=None, until=None,
+                   offset=0, limit=PAGE_SIZE):
     with Session(engine) as session:
         stmt = select(Note).order_by(Note.created_at.desc()).offset(offset).limit(limit)
         if user_id:
@@ -201,8 +230,7 @@ def get_notes_page(user_id: int = None, category: str = None,
             stmt = stmt.where(Note.created_at < until)
         return session.scalars(stmt).all()
 
-def get_all_notes_for_export(user_id: int = None, category: str = None,
-                             since: datetime = None, until: datetime = None):
+def get_all_notes_for_export(user_id=None, category=None, since=None, until=None):
     with Session(engine) as session:
         stmt = select(Note).order_by(Note.created_at.desc())
         if user_id:
@@ -220,7 +248,7 @@ def get_all_authors():
         stmt = select(Note.user_id, Note.author_name, func.count(Note.id)).group_by(Note.user_id)
         return session.execute(stmt).all()
 
-def count_by_category(user_id: int = None):
+def count_by_category(user_id=None):
     with Session(engine) as session:
         stmt = select(Note.category, func.count(Note.id)).group_by(Note.category)
         if user_id:
@@ -234,16 +262,28 @@ def clear_user_notes(user_id: int):
             session.delete(n)
         session.commit()
 
-# ============ CSV ЭКСПОРТ ============
-def build_csv(user_id: int = None, category: str = None,
-              since: datetime = None, until: datetime = None) -> BufferedInputFile:
+# ============ CSV ============
+def build_csv(user_id=None, category=None, since=None, until=None) -> BufferedInputFile:
     notes = get_all_notes_for_export(user_id=user_id, category=category,
                                      since=since, until=until)
     buf = io.StringIO()
     writer = csv.writer(buf, delimiter=";")
-    writer.writerow(["ID", "Дата", "Изменено", "Автор", "Категория", "Текст",
-                     "Фото (file_id)", "Документ", "Документ (file_id)"])
+    writer.writerow([
+        "ID", "Дата", "Изменено", "Автор", "Категория", "Текст",
+        "Фото (file_id)", "Документы"
+    ])
     for n in notes:
+        photos = []
+        docs = []
+        for att in n.attachments:
+            if att.kind == "photo":
+                photos.append(att.file_id)
+            else:
+                docs.append(f"{att.file_name or 'file'}:{att.file_id}")
+        if n.photo_id:
+            photos.append(n.photo_id)
+        if n.document_id:
+            docs.append(f"{n.document_name or 'file'}:{n.document_id}")
         writer.writerow([
             n.id,
             n.created_at.strftime("%d.%m.%Y %H:%M"),
@@ -251,15 +291,14 @@ def build_csv(user_id: int = None, category: str = None,
             n.author_name,
             CATEGORIES.get(n.category, n.category or ""),
             (n.text or "").replace("\n", " "),
-            n.photo_id or "",
-            n.document_name or "",
-            n.document_id or ""
+            ", ".join(photos),
+            ", ".join(docs),
         ])
     data = buf.getvalue().encode("utf-8-sig")
     filename = f"notes_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     return BufferedInputFile(data, filename=filename)
 
-# ============ КЛАВИАТУРЫ ============
+# ============ INLINE-КЛАВИАТУРЫ ============
 def main_menu(user_id: int):
     buttons = [
         [InlineKeyboardButton(text="📝 Новая запись", callback_data="new_note")],
@@ -285,6 +324,12 @@ def back_menu():
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu")]
     ])
 
+def draft_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Готово — сохранить", callback_data="draft_done")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="draft_cancel")],
+    ])
+
 def date_filter_menu():
     buttons = [[InlineKeyboardButton(text=name, callback_data=f"date_{key}_0")]
                for key, name in DATE_FILTERS.items()]
@@ -292,14 +337,13 @@ def date_filter_menu():
     buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def pagination_kb(prefix: str, page: int, total_pages: int,
-                  notes=None, export_cb: str = None):
+def pagination_kb(prefix, page, total_pages, notes=None, export_cb=None):
     rows = []
     if notes:
         for n in notes:
             rows.append([
-                InlineKeyboardButton(text=f"✏️ Изменить #{n.id}", callback_data=f"edit_{n.id}_{prefix}_{page}"),
-                InlineKeyboardButton(text=f"🗑 Удалить #{n.id}", callback_data=f"del_{n.id}_{prefix}_{page}"),
+                InlineKeyboardButton(text=f"✏️ #{n.id}", callback_data=f"edit_{n.id}_{prefix}_{page}"),
+                InlineKeyboardButton(text=f"🗑 #{n.id}", callback_data=f"del_{n.id}_{prefix}_{page}"),
             ])
     nav = []
     if page > 0:
@@ -313,23 +357,46 @@ def pagination_kb(prefix: str, page: int, total_pages: int,
     rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+# ============ ВСПОМОГАТЕЛЬНОЕ: отправить главное меню ============
+async def send_main_menu(message: Message):
+    user = get_user(message.from_user.id)
+    if not user:
+        await message.answer(
+            "👋 Добро пожаловать!\n\n"
+            "Сначала зарегистрируйтесь:\n"
+            "`/register Имя Фамилия`",
+            parse_mode="Markdown",
+            reply_markup=main_reply_kb()
+        )
+        return
+    await message.answer(
+        f"🏠 **Главное меню**\n\nПривет, {user.full_name}!",
+        parse_mode="Markdown",
+        reply_markup=main_menu(message.from_user.id)
+    )
+
 # ============ КОМАНДЫ ============
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_state.pop(message.from_user.id, None)
+    # Показываем Reply-клавиатуру всегда при /start
     user = get_user(message.from_user.id)
     if not user:
         await message.answer(
             "👋 Добро пожаловать в лабораторный журнал!\n\n"
             "Сначала зарегистрируйтесь:\n"
             "`/register Имя Фамилия`",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=main_reply_kb()
         )
         return
     await message.answer(
-        f"👋 Привет, {user.full_name}!\n\nВыбери действие:",
+        f"🏠 **Главное меню**\n\nПривет, {user.full_name}!",
+        parse_mode="Markdown",
         reply_markup=main_menu(message.from_user.id)
     )
+    # Дополнительно — Reply-клавиатура (если её не было)
+    await message.answer("Кнопки внизу всегда под рукой 👇", reply_markup=main_reply_kb())
 
 @dp.message(Command("register"))
 async def cmd_register(message: Message):
@@ -342,8 +409,27 @@ async def cmd_register(message: Message):
     await message.answer(
         f"✅ Вы зарегистрированы как **{full_name}**.",
         parse_mode="Markdown",
+        reply_markup=main_reply_kb()
+    )
+    await message.answer(
+        "Главное меню:",
         reply_markup=main_menu(message.from_user.id)
     )
+
+# ============ REPLY-КНОПКИ (постоянные внизу) ============
+@dp.message(F.text == "🏠 Главное меню")
+async def reply_main_menu(message: Message):
+    user_state.pop(message.from_user.id, None)
+    await send_main_menu(message)
+
+@dp.message(F.text == "📝 Новая запись")
+async def reply_new_note(message: Message):
+    if not get_user(message.from_user.id):
+        await message.answer("⚠️ Сначала зарегистрируйтесь: `/register Имя Фамилия`",
+                             parse_mode="Markdown", reply_markup=main_reply_kb())
+        return
+    user_state[message.from_user.id] = {"action": "await_category"}
+    await message.answer("🗂 Выбери категорию записи:", reply_markup=category_menu())
 
 # ============ НОВАЯ ЗАПИСЬ ============
 @dp.callback_query(F.data == "new_note")
@@ -361,21 +447,61 @@ async def cb_category_chosen(callback: CallbackQuery):
     if key not in CATEGORIES:
         await callback.answer("Неизвестная категория", show_alert=True)
         return
-    user_state[callback.from_user.id] = {"action": "await_content", "category": key}
+    user_state[callback.from_user.id] = {
+        "action": "draft",
+        "category": key,
+        "text_parts": [],
+        "attachments": [],
+    }
     await callback.message.edit_text(
         f"Категория: **{CATEGORIES[key]}**\n\n"
-        "✍️ Теперь отправь текст, фото или документ.\n"
-        "Можно прикрепить подпись к фото/документу — она сохранится как текст записи.",
-        parse_mode="Markdown"
+        f"📝 Отправляй текст, фото или документы (до {MAX_ATTACHMENTS} вложений).\n"
+        "Можно чередовать: фото, подпись, ещё фото, документ и т.д.\n\n"
+        "Когда закончишь — нажми **✅ Готово**.",
+        parse_mode="Markdown",
+        reply_markup=draft_menu()
     )
     await callback.answer()
+
+@dp.callback_query(F.data == "draft_done")
+async def cb_draft_done(callback: CallbackQuery):
+    state = user_state.get(callback.from_user.id)
+    if not state or state.get("action") != "draft":
+        await callback.answer("Черновик не найден", show_alert=True)
+        return
+    atts = state.get("attachments", [])
+    text_parts = state.get("text_parts", [])
+    text = "\n".join(text_parts) if text_parts else None
+    if not atts and not text:
+        await callback.answer("Черновик пуст. Добавь текст, фото или документ.", show_alert=True)
+        return
+    category = state["category"]
+    save_note_with_attachments(callback.from_user.id, category, text, atts)
+    user_state.pop(callback.from_user.id, None)
+    await callback.message.edit_text(
+        f"✅ Запись сохранена в категорию **{CATEGORIES[category]}**.\n"
+        f"Вложений: {len(atts)}.",
+        parse_mode="Markdown",
+        reply_markup=main_menu(callback.from_user.id)
+    )
+    await callback.answer("Сохранено")
+
+@dp.callback_query(F.data == "draft_cancel")
+async def cb_draft_cancel(callback: CallbackQuery):
+    user_state.pop(callback.from_user.id, None)
+    await callback.message.edit_text(
+        "❌ Черновик отменён. Ничего не сохранено.",
+        reply_markup=main_menu(callback.from_user.id)
+    )
+    await callback.answer("Отменено")
 
 # ============ ГЛАВНОЕ МЕНЮ ============
 @dp.callback_query(F.data == "main_menu")
 async def cb_main_menu(callback: CallbackQuery):
     user_state.pop(callback.from_user.id, None)
     await callback.message.edit_text(
-        "Главное меню:",
+        "🏠 **Главное меню**",
+        parse_mode="Markdown",
         reply_markup=main_menu(callback.from_user.id)
     )
     await callback.answer()
@@ -395,30 +521,27 @@ async def cb_by_date(callback: CallbackQuery):
     )
     await callback.answer()
 
+@dp.callback_query(F.data == "date_custom")
+async def cb_date_custom(callback: CallbackQuery):
+    user_state[callback.from_user.id] = {"action": "await_custom_date"}
+    await callback.message.edit_text(
+        "🗓 **Свой период**\n\n"
+        "Отправь одну или две даты в формате **ДД.ММ.ГГГГ**.\n"
+        "Примеры:\n"
+        "`21.09.2026` — за один день\n"
+        "`01.09.2026 15.09.2026` — диапазон\n"
+        "`21.09` — текущий год",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="by_date")],
+        ])
+    )
+    await callback.answer()
+
 @dp.callback_query(F.data.startswith("date_"))
 async def cb_date_chosen(callback: CallbackQuery):
-    # Отдельно обрабатываем «Свой период»
     if callback.data == "date_custom":
-        user_state[callback.from_user.id] = {"action": "await_custom_date"}
-        await callback.message.edit_text(
-            "🗓 **Свой период**\n\n"
-            "Отправь одну или две даты в формате **ДД.ММ.ГГГГ**.\n\n"
-            "• Одна дата — покажет записи за этот день.\n"
-            "• Две даты через пробел или дефис — диапазон.\n\n"
-            "Примеры:\n"
-            "`21.09.2026` — за 21 сентября 2026\n"
-            "`01.09.2026 15.09.2026` — с 1 по 15 сентября\n"
-            "`01.09.2026 - 15.09.2026` — то же самое\n"
-            "`21.09` — за 21 сентября текущего года",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="by_date")],
-            ])
-        )
-        await callback.answer()
         return
-
-    # формат: date_{period}_{page}
     parts = callback.data.split("_")
     period = parts[1]
     page = int(parts[2])
@@ -435,34 +558,28 @@ async def cb_edit_request(callback: CallbackQuery):
     note_id = int(parts[1])
     page = int(parts[-1])
     prefix = "_".join(parts[2:-1])
-
     note = get_note(note_id)
     if not note:
         await callback.answer("Запись уже удалена.", show_alert=True)
         return
-
     is_owner = note.user_id == callback.from_user.id
     if not (is_owner or is_admin(callback.from_user.id)):
-        await callback.answer("⛔ Ты можешь редактировать только свои записи.", show_alert=True)
+        await callback.answer("⛔ Только свои записи.", show_alert=True)
         return
-
     user_state[callback.from_user.id] = {
         "action": "await_edit",
         "note_id": note_id,
         "prefix": prefix,
-        "page": page
+        "page": page,
     }
-
     cat_name = CATEGORIES.get(note.category, note.category or "—")
-    current_text = note.text if note.text else "_(пусто)_"
+    current = note.text if note.text else "_(пусто)_"
     await callback.message.answer(
-        f"✏️ **Редактирование записи #{note_id}**\n\n"
-        f"🗂 {cat_name}\n"
-        f"👤 {note.author_name}\n"
+        f"✏️ **Редактирование #{note_id}**\n\n"
+        f"🗂 {cat_name}\n👤 {note.author_name}\n"
         f"🕒 {note.created_at.strftime('%d.%m.%Y %H:%M')}\n\n"
-        f"📝 Текущий текст:\n{current_text}\n\n"
-        f"Отправь **новый текст** одним сообщением.\n"
-        f"Чтобы отменить — нажми кнопку ниже.",
+        f"📝 Текущий текст:\n{current}\n\n"
+        "Отправь **новый текст** одним сообщением.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Отмена", callback_data=f"editcancel_{prefix}_{page}")]
@@ -487,34 +604,25 @@ async def cb_delete_request(callback: CallbackQuery):
     note_id = int(parts[1])
     page = int(parts[-1])
     prefix = "_".join(parts[2:-1])
-
     note = get_note(note_id)
     if not note:
         await callback.answer("Запись уже удалена.", show_alert=True)
         return
-
     is_owner = note.user_id == callback.from_user.id
     if not (is_owner or is_admin(callback.from_user.id)):
-        await callback.answer("⛔ Ты можешь удалять только свои записи.", show_alert=True)
+        await callback.answer("⛔ Только свои записи.", show_alert=True)
         return
-
     cat_name = CATEGORIES.get(note.category, note.category or "—")
     preview = (note.text or "")[:200]
     if len(note.text or "") > 200:
         preview += "..."
     text = (
         f"⚠️ **Удалить запись #{note.id}?**\n\n"
-        f"🗂 {cat_name}\n"
-        f"👤 {note.author_name}\n"
+        f"🗂 {cat_name}\n👤 {note.author_name}\n"
         f"🕒 {note.created_at.strftime('%d.%m.%Y %H:%M')}"
     )
     if preview:
         text += f"\n\n📝 {preview}"
-    if note.photo_id:
-        text += "\n📷 есть фото"
-    if note.document_id:
-        text += f"\n📎 {note.document_name or 'документ'}"
-
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delok_{note_id}_{prefix}_{page}")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{prefix}_page_{page}")],
@@ -528,17 +636,14 @@ async def cb_delete_confirm(callback: CallbackQuery):
     note_id = int(parts[1])
     page = int(parts[-1])
     prefix = "_".join(parts[2:-1])
-
     note = get_note(note_id)
     if not note:
         await callback.answer("Запись уже удалена.", show_alert=True)
         return
-
     is_owner = note.user_id == callback.from_user.id
     if not (is_owner or is_admin(callback.from_user.id)):
         await callback.answer("⛔ Недостаточно прав.", show_alert=True)
         return
-
     delete_note(note_id)
     await callback.message.edit_text(f"🗑 Запись #{note_id} удалена.")
     await callback.answer("Удалено")
@@ -546,10 +651,6 @@ async def cb_delete_confirm(callback: CallbackQuery):
 
 # ============ ПОКАЗ СТРАНИЦЫ ============
 async def show_page(target_message: Message, prefix: str, page: int, edit: bool = True):
-    """prefix может быть:
-    myall, mycat_<key>, all, author_<uid>, catpage_<key>, date_<period>,
-    range_<YYYYMMDD>_<YYYYMMDD>
-    """
     user_id_filter = None
     category_filter = None
     since = None
@@ -591,7 +692,6 @@ async def show_page(target_message: Message, prefix: str, page: int, edit: bool 
         if not is_admin(target_message.chat.id):
             user_id_filter = target_message.chat.id
     elif prefix.startswith("range_"):
-        # range_YYYYMMDD_YYYYMMDD
         parts = prefix.split("_")
         try:
             d1 = datetime.strptime(parts[1], "%Y%m%d")
@@ -599,7 +699,7 @@ async def show_page(target_message: Message, prefix: str, page: int, edit: bool 
         except Exception:
             return
         since = d1
-        until = d2 + timedelta(days=1)  # включая конечный день
+        until = d2 + timedelta(days=1)
         title = f"🗓 **{d1.strftime('%d.%m.%Y')} — {d2.strftime('%d.%m.%Y')}**"
         export_cb = f"export_range_{parts[1]}_{parts[2]}"
         if not is_admin(target_message.chat.id):
@@ -611,8 +711,7 @@ async def show_page(target_message: Message, prefix: str, page: int, edit: bool 
     if page >= total_pages:
         page = total_pages - 1
     notes = get_notes_page(user_id=user_id_filter, category=category_filter,
-                           since=since, until=until,
-                           offset=page * PAGE_SIZE)
+                           since=since, until=until, offset=page * PAGE_SIZE)
 
     if not notes:
         text = f"{title}\n\n_Записей нет._"
@@ -662,363 +761,4 @@ async def cb_my_notes(callback: CallbackQuery):
 async def cb_myall_page(callback: CallbackQuery):
     page = int(callback.data.split("_")[-1])
     await show_page(callback.message, "myall", page, edit=True)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("mycat_"))
-async def cb_mycat_page(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    key = parts[1]
-    page = int(parts[2])
-    await show_page(callback.message, f"mycat_{key}", page, edit=True)
-    await callback.answer()
-
-# ============ АДМИН: ВСЕ ЗАПИСИ ============
-@dp.callback_query(F.data.startswith("all_notes_"))
-async def cb_all_notes(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для наблюдателей.", show_alert=True)
-        return
-    page = int(callback.data.split("_")[-1])
-    await show_page(callback.message, "all", page, edit=True)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("all_page_"))
-async def cb_all_page(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён.", show_alert=True)
-        return
-    page = int(callback.data.split("_")[-1])
-    await show_page(callback.message, "all", page, edit=True)
-    await callback.answer()
-
-# ============ АДМИН: ПО СОТРУДНИКАМ ============
-@dp.callback_query(F.data == "by_author")
-async def cb_by_author(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для наблюдателей.", show_alert=True)
-        return
-    authors = get_all_authors()
-    if not authors:
-        await callback.message.answer("Пока нет записей.", reply_markup=back_menu())
-        await callback.answer()
-        return
-    buttons = [[InlineKeyboardButton(text=f"{name} ({c})", callback_data=f"author_{uid}_0")]
-               for uid, name, c in authors]
-    buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu")])
-    await callback.message.edit_text(
-        "👥 **Выбери сотрудника:**",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("author_"))
-async def cb_author_notes(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён.", show_alert=True)
-        return
-    parts = callback.data.split("_")
-    uid = int(parts[1])
-    page = int(parts[2])
-    await show_page(callback.message, f"author_{uid}", page, edit=True)
-    await callback.answer()
-
-# ============ АДМИН: ПО КАТЕГОРИЯМ ============
-@dp.callback_query(F.data == "by_category")
-async def cb_by_category(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для наблюдателей.", show_alert=True)
-        return
-    counts = count_by_category()
-    if not counts:
-        await callback.message.answer("Записей нет.", reply_markup=back_menu())
-        await callback.answer()
-        return
-    buttons = []
-    for key, name in CATEGORIES.items():
-        c = counts.get(key, 0)
-        buttons.append([InlineKeyboardButton(text=f"{name} ({c})", callback_data=f"catpage_{key}_0")])
-    buttons.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="main_menu")])
-    await callback.message.edit_text(
-        "🗂 **Записи по категориям:**",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("catpage_"))
-async def cb_catpage(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён.", show_alert=True)
-        return
-    parts = callback.data.split("_")
-    key = parts[1]
-    page = int(parts[2])
-    await show_page(callback.message, f"catpage_{key}", page, edit=True)
-    await callback.answer()
-
-# ============ ЭКСПОРТ CSV ============
-@dp.callback_query(F.data == "export_all")
-async def cb_export_all(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Только для наблюдателей.", show_alert=True)
-        return
-    await callback.answer("Готовлю файл...")
-    await callback.message.answer_document(build_csv(), caption="📥 Все записи (CSV)")
-
-@dp.callback_query(F.data == "export_my")
-async def cb_export_my(callback: CallbackQuery):
-    await callback.answer("Готовлю файл...")
-    await callback.message.answer_document(
-        build_csv(user_id=callback.from_user.id), caption="📥 Мои записи (CSV)")
-
-@dp.callback_query(F.data.startswith("export_my_"))
-async def cb_export_my_cat(callback: CallbackQuery):
-    key = callback.data.replace("export_my_", "")
-    await callback.answer("Готовлю файл...")
-    await callback.message.answer_document(
-        build_csv(user_id=callback.from_user.id, category=key),
-        caption=f"📥 {CATEGORIES.get(key, key)} (CSV)")
-
-@dp.callback_query(F.data.startswith("export_cat_"))
-async def cb_export_cat(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён.", show_alert=True)
-        return
-    key = callback.data.replace("export_cat_", "")
-    await callback.answer("Готовлю файл...")
-    await callback.message.answer_document(
-        build_csv(category=key), caption=f"📥 {CATEGORIES.get(key, key)} (CSV)")
-
-@dp.callback_query(F.data.startswith("export_author_"))
-async def cb_export_author(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён.", show_alert=True)
-        return
-    uid = int(callback.data.replace("export_author_", ""))
-    await callback.answer("Готовлю файл...")
-    await callback.message.answer_document(
-        build_csv(user_id=uid), caption="📥 Записи сотрудника (CSV)")
-
-@dp.callback_query(F.data.startswith("export_date_"))
-async def cb_export_date(callback: CallbackQuery):
-    period = callback.data.replace("export_date_", "")
-    if period not in DATE_FILTERS:
-        await callback.answer("Неизвестный период", show_alert=True)
-        return
-    since = date_range_start(period)
-    until = date_range_end(period)
-    user_filter = None
-    if not is_admin(callback.from_user.id):
-        user_filter = callback.from_user.id
-    await callback.answer("Готовлю файл...")
-    await callback.message.answer_document(
-        build_csv(user_id=user_filter, since=since, until=until),
-        caption=f"📥 {DATE_FILTERS[period]} (CSV)")
-
-@dp.callback_query(F.data.startswith("export_range_"))
-async def cb_export_range(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    if len(parts) < 4:
-        await callback.answer("Ошибка", show_alert=True)
-        return
-    try:
-        d1 = datetime.strptime(parts[2], "%Y%m%d")
-        d2 = datetime.strptime(parts[3], "%Y%m%d")
-    except Exception:
-        await callback.answer("Ошибка дат", show_alert=True)
-        return
-    since = d1
-    until = d2 + timedelta(days=1)
-    user_filter = None
-    if not is_admin(callback.from_user.id):
-        user_filter = callback.from_user.id
-    await callback.answer("Готовлю файл...")
-    await callback.message.answer_document(
-        build_csv(user_id=user_filter, since=since, until=until),
-        caption=f"📥 {d1.strftime('%d.%m.%Y')} — {d2.strftime('%d.%m.%Y')} (CSV)")
-
-# ============ ОЧИСТКА ============
-@dp.callback_query(F.data == "clear_my")
-async def cb_clear_my(callback: CallbackQuery):
-    clear_user_notes(callback.from_user.id)
-    await callback.message.answer("🗑 Все твои записи удалены.", reply_markup=back_menu())
-    await callback.answer()
-
-# ============ ФОРМАТИРОВАНИЕ ============
-def format_notes(notes) -> str:
-    lines = []
-    for i, n in enumerate(notes, 1):
-        cat_name = CATEGORIES.get(n.category, n.category or "—")
-        line = (f"{i}. 🆔 #{n.id}\n"
-                f"   🗂 {cat_name}\n"
-                f"   👤 {n.author_name}\n"
-                f"   🕒 {n.created_at.strftime('%d.%m.%Y %H:%M')}")
-        if n.updated_at:
-            line += f" (изм. {n.updated_at.strftime('%d.%m %H:%M')})"
-        if n.text:
-            txt = n.text[:300] + ("..." if len(n.text) > 300 else "")
-            line += f"\n   📝 {txt}"
-        if n.photo_id:
-            line += "\n   📷 (фото)"
-        if n.document_id:
-            line += f"\n   📎 {n.document_name or 'документ'}"
-        lines.append(line)
-    return "\n\n".join(lines)
-
-async def send_attachments(target_message: Message, notes):
-    for n in notes:
-        cat_name = CATEGORIES.get(n.category, n.category or "—")
-        caption_header = (
-            f"🗂 {cat_name}\n"
-            f"👤 {n.author_name}\n"
-            f"🕒 {n.created_at.strftime('%d.%m.%Y %H:%M')}"
-        )
-        if n.updated_at:
-            caption_header += f"\n✏️ изменено {n.updated_at.strftime('%d.%m.%Y %H:%M')}"
-        if n.photo_id:
-            caption = caption_header
-            if n.text:
-                caption += f"\n\n{n.text}"
-            try:
-                await target_message.answer_photo(photo=n.photo_id, caption=caption[:1024])
-            except Exception as e:
-                logging.warning(f"Не удалось отправить фото #{n.id}: {e}")
-        if n.document_id:
-            doc_caption = caption_header
-            if n.document_name:
-                doc_caption += f"\n📎 {n.document_name}"
-            try:
-                await target_message.answer_document(
-                    document=n.document_id, caption=doc_caption[:1024]
-                )
-            except Exception as e:
-                logging.warning(f"Не удалось отправить документ #{n.id}: {e}")
-
-# ============ ПРИЁМ КОНТЕНТА ============
-@dp.message(F.photo)
-async def handle_photo(message: Message):
-    state = user_state.get(message.from_user.id)
-    if not state or state.get("action") != "await_content":
-        await message.answer(
-            "⚠️ Сначала нажми «📝 Новая запись» и выбери категорию.",
-            reply_markup=main_menu(message.from_user.id)
-        )
-        return
-    category = state["category"]
-    photo_id = message.photo[-1].file_id
-    save_note(message.from_user.id, category=category,
-              text=message.caption, photo_id=photo_id)
-    user_state.pop(message.from_user.id, None)
-    await message.answer(
-        f"✅ Запись сохранена в категорию **{CATEGORIES[category]}**.",
-        parse_mode="Markdown",
-        reply_markup=main_menu(message.from_user.id)
-    )
-
-@dp.message(F.document)
-async def handle_document(message: Message):
-    state = user_state.get(message.from_user.id)
-    if not state or state.get("action") != "await_content":
-        await message.answer(
-            "⚠️ Сначала нажми «📝 Новая запись» и выбери категорию.",
-            reply_markup=main_menu(message.from_user.id)
-        )
-        return
-    category = state["category"]
-    document_id = message.document.file_id
-    document_name = message.document.file_name or "файл"
-    save_note(message.from_user.id, category=category,
-              text=message.caption,
-              document_id=document_id, document_name=document_name)
-    user_state.pop(message.from_user.id, None)
-    await message.answer(
-        f"✅ Документ сохранён в категорию **{CATEGORIES[category]}**.\n"
-        f"📎 {document_name}",
-        parse_mode="Markdown",
-        reply_markup=main_menu(message.from_user.id)
-    )
-
-@dp.message(F.text)
-async def handle_text(message: Message):
-    if message.text.startswith("/"):
-        return
-
-    state = user_state.get(message.from_user.id)
-
-    # ---- Ручной ввод дат ----
-    if state and state.get("action") == "await_custom_date":
-        text = message.text.strip()
-        # Разделители: пробел, дефис, тире, "по"
-        raw = text.replace(" - ", " ").replace(" по ", " ").replace("-", " ").replace("—", " ")
-        parts = [p for p in raw.split() if p]
-        if len(parts) == 1:
-            d1 = parse_user_date(parts[0])
-            if not d1:
-                await message.answer(
-                    "❌ Не удалось разобрать дату. Пример: `21.09.2026` или `01.09.2026 15.09.2026`",
-                    parse_mode="Markdown"
-                )
-                return
-            d1 = d1.replace(hour=0, minute=0, second=0, microsecond=0)
-            d2 = d1
-        elif len(parts) == 2:
-            d1 = parse_user_date(parts[0])
-            d2 = parse_user_date(parts[1])
-            if not d1 or not d2:
-                await message.answer(
-                    "❌ Не удалось разобрать даты. Пример: `01.09.2026 15.09.2026`",
-                    parse_mode="Markdown"
-                )
-                return
-            d1 = d1.replace(hour=0, minute=0, second=0, microsecond=0)
-            d2 = d2.replace(hour=0, minute=0, second=0, microsecond=0)
-            if d1 > d2:
-                d1, d2 = d2, d1
-        else:
-            await message.answer(
-                "❌ Слишком много дат. Отправь одну или две даты.",
-                reply_markup=back_menu()
-            )
-            return
-
-        user_state.pop(message.from_user.id, None)
-        prefix = f"range_{d1.strftime('%Y%m%d')}_{d2.strftime('%Y%m%d')}"
-        # Показываем результаты
-        await show_page(message, prefix, 0, edit=False)
-        return
-
-    # ---- Режим редактирования ----
-    if state and state.get("action") == "await_edit":
-        note_id = state["note_id"]
-        prefix = state["prefix"]
-        page = state["page"]
-        update_note_text(note_id, message.text)
-        user_state.pop(message.from_user.id, None)
-        await message.answer(f"✅ Запись #{note_id} обновлена.")
-        await show_page(message, prefix, page, edit=False)
-        return
-
-    # ---- Обычный режим — новая запись ----
-    if not state or state.get("action") != "await_content":
-        await message.answer(
-            "⚠️ Сначала нажми «📝 Новая запись» и выбери категорию.",
-            reply_markup=main_menu(message.from_user.id)
-        )
-        return
-    category = state["category"]
-    save_note(message.from_user.id, category=category, text=message.text)
-    user_state.pop(message.from_user.id, None)
-    await message.answer(
-        f"✅ Запись сохранена в категорию **{CATEGORIES[category]}**.",
-        parse_mode="Markdown",
-        reply_markup=main_menu(message.from_user.id)
-    )
-
-# ============ ЗАПУСК ============
-async def main():
-    print("Бот запущен...")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    await
